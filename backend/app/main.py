@@ -15,6 +15,12 @@ from app.api.v1 import router as api_v1_router
 async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("Starting Football Predictor API", version=settings.VERSION, env=settings.ENVIRONMENT)
+    try:
+        from app.db.session import create_tables
+        create_tables()
+        logger.info("Database tables ready")
+    except Exception as e:
+        logger.error("Database setup error", error=str(e))
     yield
     logger.info("Shutting down")
 
