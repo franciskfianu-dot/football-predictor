@@ -14,7 +14,7 @@ pydantic==2.7.1
 pydantic-settings==2.2.1
 
 # Task queue
-celery[redis]==5.4.0
+celery[redis]==5.3.6
 redis==4.6.0
 
 # HTTP / scraping

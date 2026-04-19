@@ -41,14 +41,12 @@ app.include_router(api_v1_router, prefix="/api/v1")
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Fly.io and monitoring."""
-    from app.db.session import SessionLocal
-    import redis as redis_client
-
+    """Health check endpoint."""
     status = {"status": "ok", "version": settings.VERSION}
 
-    # DB check
     try:
+        from app.db.session import SessionLocal
+        from sqlalchemy import text
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
@@ -57,9 +55,12 @@ async def health_check():
         status["database"] = f"error: {str(e)}"
         status["status"] = "degraded"
 
-    # Redis check
     try:
-        r = redis_client.from_url(settings.REDIS_URL)
+        import redis
+        r = redis.Redis.from_url(
+            settings.REDIS_URL,
+            socket_connect_timeout=3
+        )
         r.ping()
         status["redis"] = "ok"
     except Exception as e:
