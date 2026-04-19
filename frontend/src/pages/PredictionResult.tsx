@@ -169,7 +169,7 @@ export default function PredictionResult() {
               formatter={(v: number) => [`${v}%`, 'Probability']}
             />
             <Bar dataKey="prob" radius={[4, 4, 0, 0]}>
-              {scoreChartData.map((entry, i) => (
+              {scoreChartData.map((_entry, i) => (
                 <Cell
                   key={i}
                   fill={i === 0 ? '#6366f1' : i < 3 ? '#4338ca' : '#1e1b4b'}
