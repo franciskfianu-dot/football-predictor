@@ -57,10 +57,11 @@ async def health_check():
 
     try:
         import redis
-        r = redis.Redis.from_url(
-            settings.REDIS_URL,
-            socket_connect_timeout=3
-        )
+        r = redis.StrictRedis.from_url(
+    settings.REDIS_URL,
+    socket_connect_timeout=3,
+    decode_responses=True
+)
         r.ping()
         status["redis"] = "ok"
     except Exception as e:
