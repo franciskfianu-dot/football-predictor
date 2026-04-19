@@ -56,12 +56,12 @@ async def health_check():
         status["status"] = "degraded"
 
     try:
-        import redis
-        r = redis.StrictRedis.from_url(
-    settings.REDIS_URL,
-    socket_connect_timeout=3,
-    decode_responses=True
-)
+        from upstash_redis import Redis as UpstashRedis
+        import os
+        r = UpstashRedis(
+            url=os.environ.get("UPSTASH_REDIS_REST_URL", ""),
+            token=os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+        )
         r.ping()
         status["redis"] = "ok"
     except Exception as e:
