@@ -1,0 +1,63 @@
+name: Daily Retrain + Scrape
+
+on:
+  # Run every day at 02:00 UTC
+  schedule:
+    - cron: '0 2 * * *'
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      leagues:
+        description: 'Comma-separated leagues (leave blank for all)'
+        required: false
+        default: ''
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Trigger daily scrape
+        run: |
+          LEAGUES="${{ github.event.inputs.leagues }}"
+          QUERY=""
+          if [ -n "$LEAGUES" ]; then
+            QUERY="?leagues=${LEAGUES}"
+          fi
+
+          echo "Triggering scrape on ${{ secrets.FLY_APP_URL }}"
+          curl -f -X POST \
+            "${{ secrets.FLY_APP_URL }}/api/v1/admin/scrape${QUERY}" \
+            -H "x-admin-token: ${{ secrets.ADMIN_SECRET_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 30
+
+      - name: Wait for scrape to complete
+        run: sleep 120
+
+      - name: Trigger model retraining
+        run: |
+          LEAGUES="${{ github.event.inputs.leagues }}"
+          QUERY=""
+          if [ -n "$LEAGUES" ]; then
+            QUERY="?leagues=${LEAGUES}"
+          fi
+
+          echo "Triggering retrain on ${{ secrets.FLY_APP_URL }}"
+          curl -f -X POST \
+            "${{ secrets.FLY_APP_URL }}/api/v1/admin/retrain${QUERY}" \
+            -H "x-admin-token: ${{ secrets.ADMIN_SECRET_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --max-time 30
+
+          echo "Retrain queued successfully"
+
+      - name: Notify completion
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          echo "Daily pipeline status: $STATUS"
+          # Add Slack/email notification here if desired

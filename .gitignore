@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Environment files — NEVER commit secrets
+.env
+.env.local
+.env.production
+backend/.env
+frontend/.env
+
+# Model artifacts — stored on Fly.io volume, not in git
+backend/model_storage/
+*.pkl
+*.joblib
+*.pt
+*.pth
+
+# MLflow runs
+mlruns/
+mlartifacts/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes (local only)
+postgres_data/
+
+# Logs
+*.log
+logs/
+
+# Playwright / Selenium drivers
+.playwright/
+
+# Scrapy
+.scrapy/

@@ -1,0 +1,45 @@
+# fly.toml — Fly.io deployment config for football-predictor backend
+# Deploy with: fly deploy (from /backend directory)
+
+app = "football-predictor-api"
+primary_region = "lhr"   # London — closest to European football data sources
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ENVIRONMENT = "production"
+  PORT = "8000"
+  MODEL_STORAGE_PATH = "/data/models"
+
+# Persistent volume for model storage (survives deploys)
+[mounts]
+  source = "model_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false   # Keep always-on (free tier allows 3 shared VMs)
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512    # Free tier limit
+
+[checks]
+  [checks.health]
+    grace_period = "30s"
+    interval = "15s"
+    method = "GET"
+    path = "/health"
+    port = 8000
+    timeout = "10s"
+    type = "http"
