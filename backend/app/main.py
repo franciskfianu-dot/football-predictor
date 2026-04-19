@@ -59,7 +59,7 @@ async def health_check():
 
     # Redis check
     try:
-        r = redis_client.from_url(settings.REDIS_URL)
+        r = redis_client.from_url(settings.REDIS_URL, ssl_cert_reqs=None)
         r.ping()
         status["redis"] = "ok"
     except Exception as e:
