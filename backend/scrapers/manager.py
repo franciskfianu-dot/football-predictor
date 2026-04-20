@@ -4,7 +4,10 @@ persists scraped data to the database, and manages scrape health.
 """
 from typing import Optional
 from datetime import datetime, date
-import redis as redis_client
+try:
+    import redis as redis_client
+except ImportError:
+    redis_client = None
 
 from scrapers.fbref import FBrefScraper
 from scrapers.understat import UnderstatScraper
