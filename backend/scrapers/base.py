@@ -11,7 +11,7 @@ from typing import Optional, Any
 from abc import ABC, abstractmethod
 
 import httpx
-import redis as redis_client
+# redis imported below
 from fake_useragent import UserAgent
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -20,7 +20,12 @@ from app.core.logging import logger
 
 
 ua = UserAgent()
-redis_conn = redis_client.from_url(settings.REDIS_URL, decode_responses=True)
+try:
+    import redis as redis_client
+    redis_conn = redis_client.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+    redis_conn.ping()
+except Exception:
+    redis_conn = None
 
 
 class ScraperBase(ABC):
