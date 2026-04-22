@@ -1,10 +1,11 @@
 """
-Football Predictor API — FastAPI application entry point.
+Football Predictor API
 """
+import os
 from fastapi import FastAPI
-from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.logging import setup_logging, logger
@@ -28,15 +29,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description="Football score prediction engine — EPL, La Liga, Serie A, Bundesliga, Ligue 1",
+    description="Football score prediction engine",
     lifespan=lifespan,
-    docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
-    redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
+    docs_url="/docs",
+    redoc_url=None,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,12 +48,11 @@ app.include_router(api_v1_router, prefix="/api/v1")
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
     status = {"status": "ok", "version": settings.VERSION}
 
+    # DB check
     try:
         from app.db.session import SessionLocal
-        from sqlalchemy import text
         db = SessionLocal()
         db.execute(text("SELECT 1"))
         db.close()
@@ -61,10 +61,10 @@ async def health_check():
         status["database"] = f"error: {str(e)}"
         status["status"] = "degraded"
 
+    # Redis check via Upstash HTTP
     try:
-        from upstash_redis import Redis as UpstashRedis
-        import os
-        r = UpstashRedis(
+        from upstash_redis import Redis
+        r = Redis(
             url=os.environ.get("UPSTASH_REDIS_REST_URL", ""),
             token=os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
         )

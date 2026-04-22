@@ -1,55 +1,51 @@
 """
-ScraperManager: orchestrates all scrapers, prevents duplicate runs,
-persists scraped data to the database, and manages scrape health.
+ScraperManager: orchestrates all scrapers and persists data to the database.
+Uses in-memory locking instead of Redis to avoid connection issues.
 """
 from typing import Optional
 from datetime import datetime, date
-try:
-    import redis as redis_client
-except ImportError:
-    redis_client = None
 
 from scrapers.fbref import FBrefScraper
 from scrapers.understat import UnderstatScraper
-from scrapers.transfermarkt import TransfermarktScraper
 from scrapers.sofascore import SofaScoreScraper
-from scrapers.oddsportal import OddsportalScraper
-from scrapers.weather import WeatherScraper
 from app.core.config import settings
 from app.core.logging import logger
 
-
-redis_conn = redis_client.from_url(settings.REDIS_URL, decode_responses=True)
+# In-memory lock to prevent duplicate scrape runs
+_active_scrapes: set = set()
 
 
 class ScraperManager:
-    """
-    Orchestrates all data scrapers.
-
-    Features:
-    - Redis lock to prevent duplicate concurrent scrape runs
-    - Persists results to PostgreSQL
-    - Health tracking per source
-    - Graceful partial failure (one source failing doesn't stop others)
-    """
-
     def __init__(self):
         self.fbref = FBrefScraper()
         self.understat = UnderstatScraper()
-        self.transfermarkt = TransfermarktScraper()
         self.sofascore = SofaScoreScraper()
-        self.oddsportal = OddsportalScraper()
-        self.weather = WeatherScraper()
 
-    def scrape_full_history(
-        self,
-        leagues: list[str],
-        seasons: int = 3,
-    ) -> dict:
-        """
-        Initial data load: scrape N seasons of history for given leagues.
-        Used during first setup / seeding.
-        """
+    def scrape_daily_update(self, leagues: Optional[list] = None) -> dict:
+        """Daily update: fetch recent results and upcoming fixtures."""
+        leagues = leagues or settings.SUPPORTED_LEAGUES
+        results = {}
+
+        for league in leagues:
+            lock_key = f"daily:{league}:{date.today()}"
+            if lock_key in _active_scrapes:
+                logger.info("Scrape already running", league=league)
+                results[league] = {"skipped": True}
+                continue
+
+            _active_scrapes.add(lock_key)
+            try:
+                results[league] = self._update_league(league)
+            except Exception as e:
+                logger.error("League update failed", league=league, error=str(e))
+                results[league] = {"error": str(e)}
+            finally:
+                _active_scrapes.discard(lock_key)
+
+        return results
+
+    def scrape_full_history(self, leagues: list, seasons: int = 3) -> dict:
+        """Scrape full historical data for initial setup."""
         results = {}
         current_year = datetime.utcnow().year
 
@@ -59,198 +55,209 @@ class ScraperManager:
                 year = current_year - i - 1
                 season = f"{year}-{year + 1}"
                 logger.info("Scraping season", league=league, season=season)
-
-                lock_key = f"scrape_lock:{league}:{season}"
-                if redis_conn.get(lock_key):
-                    logger.info("Scrape already running", league=league, season=season)
-                    continue
-
-                redis_conn.setex(lock_key, 3600, "1")
                 try:
-                    season_result = self._scrape_season(league, season)
-                    results[league]["seasons"][season] = season_result
+                    result = self._scrape_season(league, season)
+                    results[league]["seasons"][season] = result
                 except Exception as e:
                     results[league]["errors"].append(str(e))
-                    logger.error("Season scrape failed", league=league, season=season, error=str(e))
-                finally:
-                    redis_conn.delete(lock_key)
+                    logger.error("Season scrape failed", league=league,
+                               season=season, error=str(e))
 
         return results
 
-    def scrape_daily_update(self, leagues: Optional[list[str]] = None) -> dict:
-        """
-        Daily update: fetch yesterday's results + upcoming fixtures.
-        Called by the nightly GitHub Actions cron.
-        """
-        leagues = leagues or settings.SUPPORTED_LEAGUES
-        results = {}
-
-        for league in leagues:
-            lock_key = f"daily_lock:{league}:{date.today()}"
-            if redis_conn.get(lock_key):
-                logger.info("Daily scrape already done", league=league)
-                continue
-
-            redis_conn.setex(lock_key, 7200, "1")
-            try:
-                results[league] = self._daily_update_league(league)
-            except Exception as e:
-                logger.error("Daily update failed", league=league, error=str(e))
-                results[league] = {"error": str(e)}
-            finally:
-                redis_conn.delete(lock_key)
-
-        return results
-
-    def scrape_pre_match(self, league_slug: str, home_team: str, away_team: str) -> dict:
-        """
-        On-demand scrape for a specific upcoming match.
-        Fetches: lineups, weather, current odds, injuries.
-        """
-        logger.info("Pre-match scrape", league=league_slug, home=home_team, away=away_team)
-        data = {}
-
-        # Current injuries/suspensions
-        try:
-            data["injuries"] = self.transfermarkt.scrape_injuries(league_slug)
-            data["suspensions"] = self.transfermarkt.scrape_suspensions(league_slug)
-        except Exception as e:
-            logger.warning("Injuries scrape failed", error=str(e))
-            data["injuries"] = []
-            data["suspensions"] = []
-
-        # Upcoming odds
-        try:
-            data["odds"] = self.oddsportal.scrape_upcoming_odds(league_slug)
-        except Exception as e:
-            logger.warning("Odds scrape failed", error=str(e))
-            data["odds"] = []
-
-        return data
-
-    def _scrape_season(self, league: str, season: str) -> dict:
-        """Scrape all data sources for one league/season."""
+    def _update_league(self, league: str) -> dict:
         result = {}
-
-        # FBref: match results + xG
-        try:
-            fbref_matches = self.fbref.scrape_league_season(league, season)
-            result["fbref_matches"] = len(fbref_matches)
-            self._persist_matches(fbref_matches, "fbref")
-        except Exception as e:
-            result["fbref_error"] = str(e)
-
-        # Understat: shot-level xG
-        try:
-            understat_matches = self.understat.scrape_league_season(league, season)
-            result["understat_matches"] = len(understat_matches)
-            self._merge_understat_data(understat_matches)
-        except Exception as e:
-            result["understat_error"] = str(e)
-
-        # Odds (historical closing)
-        try:
-            odds = self.oddsportal.scrape_league_season(league, season)
-            result["odds_records"] = len(odds)
-            self._persist_odds(odds)
-        except Exception as e:
-            result["odds_error"] = str(e)
-
-        return result
-
-    def _daily_update_league(self, league: str) -> dict:
-        """Daily update for a single league."""
         current_year = datetime.utcnow().year
         season = f"{current_year - 1}-{current_year}"
 
-        result = {}
-
-        # Yesterday's results
+        # Scrape recent FBref results
         try:
             matches = self.fbref.scrape_league_season(league, season)
-            recent = [m for m in matches if self._is_recent(m.get("match_date"))]
-            result["new_results"] = len(recent)
-            self._persist_matches(recent, "fbref")
+            self._persist_matches(matches, league)
+            result["fbref_matches"] = len(matches)
+            logger.info("FBref scrape done", league=league, matches=len(matches))
         except Exception as e:
             result["fbref_error"] = str(e)
+            logger.error("FBref scrape failed", league=league, error=str(e))
 
-        # Upcoming fixtures
+        # Scrape upcoming fixtures from SofaScore
         try:
             fixtures = self.sofascore.scrape_upcoming_fixtures(league, days_ahead=7)
+            self._persist_fixtures(fixtures, league)
             result["upcoming_fixtures"] = len(fixtures)
-            self._persist_fixtures(fixtures)
         except Exception as e:
             result["sofascore_error"] = str(e)
 
-        # Injuries
-        try:
-            injuries = self.transfermarkt.scrape_injuries(league)
-            result["injuries"] = len(injuries)
-            self._persist_player_availability(injuries)
-        except Exception as e:
-            result["injuries_error"] = str(e)
+        return result
 
-        # Live odds
+    def _scrape_season(self, league: str, season: str) -> dict:
+        result = {}
+
         try:
-            odds = self.oddsportal.scrape_upcoming_odds(league)
-            result["odds"] = len(odds)
-            self._persist_odds(odds)
+            matches = self.fbref.scrape_league_season(league, season)
+            self._persist_matches(matches, league)
+            result["fbref_matches"] = len(matches)
         except Exception as e:
-            result["odds_error"] = str(e)
+            result["fbref_error"] = str(e)
+
+        try:
+            understat = self.understat.scrape_league_season(league, season)
+            result["understat_matches"] = len(understat)
+        except Exception as e:
+            result["understat_error"] = str(e)
 
         return result
 
-    def _persist_matches(self, matches: list[dict], source: str) -> None:
-        """Save scraped match data to the database."""
+    def _persist_matches(self, matches: list, league: str) -> None:
+        """Persist scraped matches to database."""
         if not matches:
             return
         try:
             from app.db.session import SessionLocal
-            from app.db.models import Match, Team, League
+            from app.db.models import Match, Team, League as LeagueModel
             db = SessionLocal()
 
+            league_obj = db.query(LeagueModel).filter(
+                LeagueModel.slug == league
+            ).first()
+
+            if not league_obj:
+                db.close()
+                return
+
+            saved = 0
             for m in matches:
-                # Lookup or create team/league references here
-                # (simplified — full implementation resolves FKs)
-                pass
+                try:
+                    home = db.query(Team).filter(
+                        Team.league_id == league_obj.id,
+                        Team.name.ilike(f"%{m.get('home_team_name', '')}%")
+                    ).first()
 
+                    away = db.query(Team).filter(
+                        Team.league_id == league_obj.id,
+                        Team.name.ilike(f"%{m.get('away_team_name', '')}%")
+                    ).first()
+
+                    if not home or not away:
+                        continue
+
+                    # Check if match already exists
+                    match_date_str = m.get("match_date", "")
+                    if not match_date_str:
+                        continue
+
+                    from datetime import datetime as dt
+                    try:
+                        match_date = dt.fromisoformat(match_date_str)
+                    except Exception:
+                        from dateutil import parser as dparser
+                        match_date = dparser.parse(match_date_str)
+
+                    existing = db.query(Match).filter(
+                        Match.home_team_id == home.id,
+                        Match.away_team_id == away.id,
+                        Match.match_date == match_date,
+                    ).first()
+
+                    if existing:
+                        # Update score if available
+                        if m.get("home_goals") is not None:
+                            existing.home_goals = m["home_goals"]
+                            existing.away_goals = m["away_goals"]
+                            existing.status = "finished"
+                        continue
+
+                    match = Match(
+                        league_id=league_obj.id,
+                        season=m.get("season", ""),
+                        matchday=m.get("matchday"),
+                        match_date=match_date,
+                        home_team_id=home.id,
+                        away_team_id=away.id,
+                        home_goals=m.get("home_goals"),
+                        away_goals=m.get("away_goals"),
+                        home_xg=m.get("home_xg"),
+                        away_xg=m.get("away_xg"),
+                        status="finished" if m.get("home_goals") is not None else "scheduled",
+                        fbref_id=m.get("fbref_match_id"),
+                    )
+                    db.add(match)
+                    saved += 1
+                except Exception as e:
+                    logger.debug("Match persist error", error=str(e))
+                    continue
+
+            db.commit()
             db.close()
+            logger.info("Matches saved", league=league, count=saved)
         except Exception as e:
-            logger.error("Persist matches failed", source=source, error=str(e))
+            logger.error("Persist matches failed", error=str(e))
 
-    def _persist_odds(self, odds: list[dict]) -> None:
-        """Save odds data to the database."""
-        if not odds:
+    def _persist_fixtures(self, fixtures: list, league: str) -> None:
+        """Persist upcoming fixtures to database."""
+        if not fixtures:
             return
         try:
             from app.db.session import SessionLocal
-            from app.db.models import MatchOdds
+            from app.db.models import Match, Team, League as LeagueModel
+            from datetime import datetime as dt
             db = SessionLocal()
-            # Upsert odds records
+
+            league_obj = db.query(LeagueModel).filter(
+                LeagueModel.slug == league
+            ).first()
+
+            if not league_obj:
+                db.close()
+                return
+
+            for f in fixtures:
+                try:
+                    home = db.query(Team).filter(
+                        Team.league_id == league_obj.id,
+                        Team.name.ilike(f"%{f.get('home_team_name', '')}%")
+                    ).first()
+
+                    away = db.query(Team).filter(
+                        Team.league_id == league_obj.id,
+                        Team.name.ilike(f"%{f.get('away_team_name', '')}%")
+                    ).first()
+
+                    if not home or not away:
+                        continue
+
+                    match_date_str = f.get("match_date", "")
+                    if not match_date_str:
+                        continue
+
+                    try:
+                        match_date = dt.fromisoformat(match_date_str)
+                    except Exception:
+                        from dateutil import parser as dparser
+                        match_date = dparser.parse(match_date_str)
+
+                    existing = db.query(Match).filter(
+                        Match.home_team_id == home.id,
+                        Match.away_team_id == away.id,
+                        Match.match_date == match_date,
+                    ).first()
+
+                    if not existing:
+                        match = Match(
+                            league_id=league_obj.id,
+                            season=f.get("season", ""),
+                            matchday=f.get("matchday"),
+                            match_date=match_date,
+                            home_team_id=home.id,
+                            away_team_id=away.id,
+                            status="scheduled",
+                            sofascore_id=f.get("sofascore_event_id"),
+                        )
+                        db.add(match)
+                except Exception:
+                    continue
+
+            db.commit()
             db.close()
         except Exception as e:
-            logger.error("Persist odds failed", error=str(e))
-
-    def _persist_fixtures(self, fixtures: list[dict]) -> None:
-        """Save upcoming fixtures to the database."""
-        pass  # Same pattern as _persist_matches
-
-    def _persist_player_availability(self, players: list[dict]) -> None:
-        """Save injury/suspension data."""
-        pass  # Stored in Redis as short-lived availability cache
-
-    def _merge_understat_data(self, understat_matches: list[dict]) -> None:
-        """Merge Understat xG data into existing FBref match records."""
-        pass
-
-    def _is_recent(self, date_str: Optional[str], days: int = 2) -> bool:
-        """Check if a date string is within the last N days."""
-        if not date_str:
-            return False
-        try:
-            from dateutil import parser
-            dt = parser.parse(date_str)
-            delta = datetime.utcnow() - dt.replace(tzinfo=None)
-            return 0 <= delta.days <= days
-        except Exception:
-            return False
+            logger.error("Persist fixtures failed", error=str(e))

@@ -1,6 +1,6 @@
 """
-Base scraper with Redis caching, rate limiting, retry logic, and health logging.
-All scrapers inherit from this class.
+Base scraper with in-memory caching, rate limiting, and retry logic.
+Uses in-memory cache instead of Redis to avoid connection issues on free tier.
 """
 import time
 import hashlib
@@ -11,35 +11,43 @@ from typing import Optional, Any
 from abc import ABC, abstractmethod
 
 import httpx
-# redis imported below
-from fake_useragent import UserAgent
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.core.config import settings
 from app.core.logging import logger
 
+# Simple in-memory cache - avoids all Redis TCP connection issues
+_cache: dict = {}
+_cache_expiry: dict = {}
 
-ua = UserAgent()
-try:
-    import redis as redis_client
-    redis_conn = redis_client.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2)
-    redis_conn.ping()
-except Exception:
-    redis_conn = None
+
+def cache_get(key: str) -> Optional[str]:
+    if key in _cache:
+        if time.time() < _cache_expiry.get(key, 0):
+            return _cache[key]
+        else:
+            del _cache[key]
+            _cache_expiry.pop(key, None)
+    return None
+
+
+def cache_set(key: str, value: str, ttl: int = 21600) -> None:
+    _cache[key] = value
+    _cache_expiry[key] = time.time() + ttl
+
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
 
 
 class ScraperBase(ABC):
-    """
-    Base class for all scrapers.
-
-    Features:
-    - Redis response caching (6h TTL by default)
-    - Configurable delay between requests
-    - Exponential backoff retry (3 attempts)
-    - Health logging to DB via log_scrape()
-    - Random user-agent rotation
-    """
-
     SOURCE_NAME: str = "base"
     BASE_URL: str = ""
     CACHE_TTL: int = settings.SCRAPE_CACHE_TTL_SECONDS
@@ -49,7 +57,7 @@ class ScraperBase(ABC):
         self.session = httpx.Client(
             timeout=30.0,
             follow_redirects=True,
-            headers={"User-Agent": ua.random},
+            headers=HEADERS,
         )
         self._start_time: Optional[float] = None
         self._records_scraped: int = 0
@@ -59,24 +67,17 @@ class ScraperBase(ABC):
         return f"scrape:{self.SOURCE_NAME}:{hashlib.md5(raw.encode()).hexdigest()}"
 
     def _get_cached(self, cache_key: str) -> Optional[str]:
-        try:
-            return redis_conn.get(cache_key)
-        except Exception:
-            return None
+        return cache_get(cache_key)
 
     def _set_cached(self, cache_key: str, content: str) -> None:
-        try:
-            redis_conn.setex(cache_key, self.CACHE_TTL, content)
-        except Exception:
-            pass
+        cache_set(cache_key, content, self.CACHE_TTL)
 
     @retry(
-        stop=stop_after_attempt(settings.SCRAPE_RETRY_COUNT),
+        stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=30),
         retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
     )
     def fetch(self, url: str, params: dict = None, use_cache: bool = True) -> str:
-        """Fetch a URL with caching, rate limiting, and retry."""
         cache_key = self._cache_key(url, params)
 
         if use_cache:
@@ -85,11 +86,7 @@ class ScraperBase(ABC):
                 logger.debug("Cache hit", source=self.SOURCE_NAME, url=url)
                 return cached
 
-        # Polite delay + small jitter
         time.sleep(self.delay + random.uniform(0, 1.0))
-
-        # Rotate user agent per request
-        self.session.headers.update({"User-Agent": ua.random})
 
         logger.info("Fetching URL", source=self.SOURCE_NAME, url=url)
         response = self.session.get(url, params=params)
@@ -102,14 +99,12 @@ class ScraperBase(ABC):
         return content
 
     def fetch_json(self, url: str, params: dict = None, headers: dict = None) -> Any:
-        """Fetch a JSON endpoint."""
         cache_key = self._cache_key(url, params)
         cached = self._get_cached(cache_key)
         if cached:
             return json.loads(cached)
 
         time.sleep(self.delay + random.uniform(0, 0.5))
-        self.session.headers.update({"User-Agent": ua.random})
         if headers:
             self.session.headers.update(headers)
 
@@ -127,24 +122,12 @@ class ScraperBase(ABC):
     def log_scrape_end(self, status: str = "success", error: str = None,
                        target_url: str = None) -> None:
         duration = time.time() - self._start_time if self._start_time else 0
-
-        log_data = {
-            "source": self.SOURCE_NAME,
-            "status": status,
-            "records_scraped": self._records_scraped,
-            "duration_seconds": round(duration, 2),
-        }
-        if error:
-            log_data["error"] = error
-        if target_url:
-            log_data["url"] = target_url
-
         if status == "success":
-            logger.info("Scrape complete", **log_data)
+            logger.info("Scrape complete", source=self.SOURCE_NAME,
+                       records=self._records_scraped, duration=round(duration, 2))
         else:
-            logger.error("Scrape failed", **log_data)
+            logger.error("Scrape failed", source=self.SOURCE_NAME, error=error)
 
-        # Write to DB scrape log table
         try:
             from app.db.session import SessionLocal
             from app.db.models import ScrapeLog
@@ -161,8 +144,8 @@ class ScraperBase(ABC):
             db.add(log)
             db.commit()
             db.close()
-        except Exception as e:
-            logger.warning("Failed to write scrape log", error=str(e))
+        except Exception:
+            pass
 
     def __del__(self):
         try:
@@ -172,5 +155,4 @@ class ScraperBase(ABC):
 
     @abstractmethod
     def scrape_league_season(self, league_slug: str, season: str) -> list[dict]:
-        """Each scraper must implement this."""
         pass
