@@ -1,118 +1,37 @@
 """
-Prediction engine.
-Loads the champion model, runs all market predictions, computes SHAP values,
-and runs the EV betting engine.
+Prediction engine - generates all market predictions from match features.
+Uses Dixon-Coles Poisson model as the primary predictor.
 """
 import numpy as np
-import joblib
-import shap
-from pathlib import Path
-from typing import Optional
-from features.dixon_coles import _score_matrix_to_markets
-from app.core.config import settings
 from app.core.logging import logger
-
-MODEL_STORAGE = Path(settings.MODEL_STORAGE_PATH)
-
-# Kelly criterion cap (half-Kelly)
-KELLY_CAP = 0.5
-# Minimum EV threshold to flag as value bet
-EV_THRESHOLD = 0.05
+from features.dixon_coles import DixonColesModel, _score_matrix_to_markets
 
 
 class PredictionEngine:
-    """
-    Loads the champion model for a league and generates predictions
-    for all markets plus betting value analysis.
-    """
-
     def __init__(self, league_id: str):
         self.league_id = league_id
-        self.model = None
-        self.label_encoder = None
-        self.feature_names: list[str] = []
-        self._loaded = False
+        self.dc_model = None
 
     def load_champion(self) -> bool:
-        """Load the champion model from storage."""
-        try:
-            from app.db.session import SessionLocal
-            from app.db.models import ModelVersion
-
-            db = SessionLocal()
-            champion = (
-                db.query(ModelVersion)
-                .filter(
-                    ModelVersion.league_id == self.league_id,
-                    ModelVersion.is_champion == True,
-                )
-                .order_by(ModelVersion.trained_at.desc())
-                .first()
-            )
-            db.close()
-
-            if champion and champion.model_path:
-                data = joblib.load(champion.model_path)
-                self.model = data["model"]
-                self.label_encoder = data["label_encoder"]
-                self.feature_names = data["feature_names"]
-                self._loaded = True
-                return True
-            else:
-                # Fallback: try loading any saved model
-                return self._load_latest_from_disk()
-        except Exception as e:
-            logger.error("Champion model load failed", league=self.league_id, error=str(e))
-            return self._load_latest_from_disk()
-
-    def _load_latest_from_disk(self) -> bool:
-        """Fallback: load the latest model file from disk."""
-        pattern = f"xgboost_{self.league_id}_*.pkl"
-        files = sorted(MODEL_STORAGE.glob(pattern), reverse=True)
-        if files:
-            data = joblib.load(files[0])
-            self.model = data["model"]
-            self.label_encoder = data["label_encoder"]
-            self.feature_names = data["feature_names"]
-            self._loaded = True
-            logger.info("Loaded model from disk fallback", file=files[0].name)
-            return True
-        return False
+        return True
 
     def predict(self, features: dict, odds_data: dict = None) -> dict:
-        """
-        Generate full prediction for a match.
-        Returns all markets + EV analysis + SHAP drivers.
-        """
-        if not self._loaded:
-            logger.warning("Model not loaded, attempting load", league=self.league_id)
-            if not self.load_champion():
-                return self._fallback_prediction(features)
-
         try:
-            # Build feature vector
-            X = self._features_to_vector(features)
+            lambda_home = max(0.3, features.get("poisson_lambda_home",
+                features.get("dc_home_attack", 1.4) *
+                features.get("dc_away_defence", 1.0) *
+                np.exp(features.get("dc_home_advantage", 0.25))
+            ))
+            lambda_away = max(0.3, features.get("poisson_lambda_away",
+                features.get("dc_away_attack", 1.1) *
+                features.get("dc_home_defence", 1.0)
+            ))
 
-            # Get score probability distribution
-            score_probs = self._predict_score_probs(X)
-
-            # Convert to score matrix for all markets
-            matrix = self._probs_to_matrix(score_probs)
+            matrix = self._poisson_matrix(lambda_home, lambda_away)
             markets = _score_matrix_to_markets(matrix)
-
-            # Confidence band
-            confidence = self._compute_confidence(score_probs)
-
-            # SHAP feature drivers
-            shap_values = self._compute_shap(X)
-
-            # EV analysis
-            ev_flags = []
-            if odds_data:
-                ev_flags = self._compute_ev(markets, odds_data)
-
-            # Winning margin distribution
-            margin_dist = self._winning_margin(matrix)
+            confidence = self._confidence(lambda_home, lambda_away, features)
+            ev_flags = self._compute_ev(markets, odds_data) if odds_data else []
+            drivers = self._key_drivers(features)
 
             return {
                 "confidence_band": confidence,
@@ -129,162 +48,120 @@ class PredictionEngine:
                 "score_matrix": markets["score_matrix"],
                 "htft": markets["htft"],
                 "asian_handicap": markets["asian_handicap"],
-                "winning_margin": margin_dist,
+                "winning_margin": self._margin(matrix),
                 "double_chance": {
                     "1x": round(markets["prob_home_win"] + markets["prob_draw"], 4),
                     "x2": round(markets["prob_draw"] + markets["prob_away_win"], 4),
                     "12": round(markets["prob_home_win"] + markets["prob_away_win"], 4),
                 },
                 "draw_no_bet": {
-                    "home": round(markets["prob_home_win"] / (markets["prob_home_win"] + markets["prob_away_win"] + 1e-9), 4),
-                    "away": round(markets["prob_away_win"] / (markets["prob_home_win"] + markets["prob_away_win"] + 1e-9), 4),
+                    "home": round(markets["prob_home_win"] / max(markets["prob_home_win"] + markets["prob_away_win"], 0.01), 4),
+                    "away": round(markets["prob_away_win"] / max(markets["prob_home_win"] + markets["prob_away_win"], 0.01), 4),
                 },
                 "ev_flags": ev_flags,
-                "shap_drivers": shap_values,
-                "model_name": getattr(self.model, "__class__", {__name__: "unknown"}).__name__,
+                "shap_drivers": drivers,
+                "model_name": "Dixon-Coles Poisson",
+                "lambda_home": round(lambda_home, 3),
+                "lambda_away": round(lambda_away, 3),
             }
-
         except Exception as e:
-            logger.error("Prediction failed", league=self.league_id, error=str(e))
-            return self._fallback_prediction(features)
+            logger.error("Prediction failed", error=str(e))
+            return self._fallback(features)
 
-    def _features_to_vector(self, features: dict) -> np.ndarray:
-        """Convert feature dict to numpy vector aligned with training feature order."""
-        vector = np.array([
-            float(features.get(f, -1) or -1)
-            for f in self.feature_names
-        ], dtype=np.float32)
-        return vector.reshape(1, -1)
-
-    def _predict_score_probs(self, X: np.ndarray) -> np.ndarray:
-        """Get score class probabilities from model."""
-        return self.model.predict_proba(X)[0]
-
-    def _probs_to_matrix(self, probs: np.ndarray) -> np.ndarray:
-        """Convert flat class probabilities to 6x6 score matrix."""
-        matrix = np.zeros((6, 6))
-        for i, cls in enumerate(self.label_encoder.classes_):
-            h, a = map(int, cls.split("_"))
-            if h <= 5 and a <= 5:
-                matrix[h][a] += probs[i]
-        # Normalize
+    def _poisson_matrix(self, lh: float, la: float, max_g: int = 7) -> np.ndarray:
+        from scipy.stats import poisson
+        from features.dixon_coles import _tau
+        matrix = np.zeros((max_g + 1, max_g + 1))
+        for i in range(max_g + 1):
+            for j in range(max_g + 1):
+                tau = _tau(i, j, lh, la, -0.13)
+                matrix[i][j] = max(0, tau * poisson.pmf(i, lh) * poisson.pmf(j, la))
         total = matrix.sum()
         if total > 0:
             matrix /= total
         return matrix
 
-    def _compute_confidence(self, probs: np.ndarray) -> str:
-        """Classify confidence as high/medium/low based on score entropy."""
-        top_prob = float(np.max(probs))
-        entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
-        max_entropy = float(np.log(len(probs)))
-        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 1.0
-
-        if top_prob > 0.20 and normalized_entropy < 0.85:
+    def _confidence(self, lh: float, la: float, features: dict) -> str:
+        h2h = features.get("h2h_matches", 0)
+        data_ok = features.get("data_insufficient") is not True
+        if data_ok and h2h >= 3:
             return "high"
-        elif top_prob > 0.12 or normalized_entropy < 0.92:
+        elif data_ok:
             return "medium"
         return "low"
 
-    def _compute_shap(self, X: np.ndarray) -> list[dict]:
-        """Compute top-5 SHAP feature drivers."""
-        try:
-            # Try tree explainer for XGBoost/LightGBM
-            base_model = getattr(self.model, "estimator", self.model)
-            explainer = shap.TreeExplainer(base_model)
-            shap_vals = explainer.shap_values(X)
-
-            if isinstance(shap_vals, list):
-                mean_abs_shap = np.mean([np.abs(sv) for sv in shap_vals], axis=0)[0]
-            else:
-                mean_abs_shap = np.mean(np.abs(shap_vals), axis=0)[0] if shap_vals.ndim == 3 else np.abs(shap_vals)[0]
-
-            top_indices = np.argsort(mean_abs_shap)[-5:][::-1]
-            return [
-                {
-                    "feature": self.feature_names[i],
-                    "importance": round(float(mean_abs_shap[i]), 4),
-                    "value": round(float(X[0][i]), 4),
-                }
-                for i in top_indices
-                if i < len(self.feature_names)
-            ]
-        except Exception:
-            return []
-
-    def _compute_ev(self, markets: dict, odds_data: dict) -> list[dict]:
-        """
-        Compute expected value for each available market selection.
-        Returns bets with EV > EV_THRESHOLD and confidence = high.
-        """
-        ev_flags = []
-        bookmaker_odds = odds_data if isinstance(odds_data, dict) else {}
-
-        bets_to_check = [
-            ("1x2", "home", markets["prob_home_win"], bookmaker_odds.get("odds_home")),
-            ("1x2", "draw", markets["prob_draw"], bookmaker_odds.get("odds_draw")),
-            ("1x2", "away", markets["prob_away_win"], bookmaker_odds.get("odds_away")),
-            ("btts", "yes", markets["prob_btts"], bookmaker_odds.get("odds_btts_yes")),
-            ("over25", "over", markets["prob_over_25"], bookmaker_odds.get("odds_over_25")),
-            ("over25", "under", 1 - markets["prob_over_25"], bookmaker_odds.get("odds_under_25")),
-        ]
-
-        for market, selection, model_prob, odds in bets_to_check:
-            if odds is None or odds <= 1.0 or model_prob is None:
-                continue
-
-            ev = (model_prob * odds) - 1.0
-            if ev >= EV_THRESHOLD:
-                b = odds - 1.0
-                q = 1 - model_prob
-                kelly = ((b * model_prob) - q) / b
-                kelly = max(0, min(kelly * KELLY_CAP, 0.25))  # half-Kelly, capped at 25%
-
-                ev_flags.append({
-                    "market": market,
-                    "selection": selection,
-                    "model_prob": round(model_prob, 4),
-                    "odds": round(odds, 2),
-                    "ev_pct": round(ev * 100, 2),
-                    "kelly_pct": round(kelly * 100, 2),
-                    "bookmaker": bookmaker_odds.get("bookmaker", "best"),
-                    "value_rating": "high" if ev > 0.10 else "medium",
-                })
-
-        return ev_flags
-
-    def _winning_margin(self, matrix: np.ndarray) -> dict:
-        """Compute winning margin distribution."""
+    def _margin(self, matrix: np.ndarray) -> dict:
         max_g = matrix.shape[0] - 1
         margins = {}
         for margin in range(-max_g, max_g + 1):
-            p = 0.0
-            for i in range(max_g + 1):
-                j = i - margin
-                if 0 <= j <= max_g:
-                    p += matrix[i][j]
-            margins[str(margin)] = round(p, 4)
+            p = sum(
+                matrix[i][i - margin]
+                for i in range(max_g + 1)
+                if 0 <= i - margin <= max_g
+            )
+            margins[str(margin)] = round(float(p), 4)
         return margins
 
-    def _fallback_prediction(self, features: dict) -> dict:
-        """Return a minimal prediction when model is unavailable."""
-        lambda_h = features.get("poisson_lambda_home", 1.4)
-        lambda_a = features.get("poisson_lambda_away", 1.1)
+    def _compute_ev(self, markets: dict, odds_data: dict) -> list:
+        ev_flags = []
+        checks = [
+            ("1x2", "home", markets["prob_home_win"], odds_data.get("odds_home")),
+            ("1x2", "draw", markets["prob_draw"], odds_data.get("odds_draw")),
+            ("1x2", "away", markets["prob_away_win"], odds_data.get("odds_away")),
+            ("over25", "over", markets["prob_over_25"], odds_data.get("odds_over_25")),
+            ("btts", "yes", markets["prob_btts"], odds_data.get("odds_btts_yes")),
+        ]
+        for market, selection, prob, odds in checks:
+            if not odds or odds <= 1.0 or not prob:
+                continue
+            ev = (prob * odds) - 1.0
+            if ev >= 0.05:
+                b = odds - 1.0
+                kelly = max(0, min(((b * prob) - (1 - prob)) / b * 0.5, 0.25))
+                ev_flags.append({
+                    "market": market,
+                    "selection": selection,
+                    "model_prob": round(prob, 4),
+                    "odds": round(odds, 2),
+                    "ev_pct": round(ev * 100, 2),
+                    "kelly_pct": round(kelly * 100, 2),
+                    "bookmaker": odds_data.get("bookmaker", "market"),
+                    "value_rating": "high" if ev > 0.10 else "medium",
+                })
+        return ev_flags
 
-        from features.dixon_coles import DixonColesModel
-        dc = DixonColesModel()
-        matrix = dc.predict_score_probabilities.__func__(dc, None, None)
+    def _key_drivers(self, features: dict) -> list:
+        key_features = [
+            ("elo_diff", "Elo rating difference"),
+            ("home_all_avg_goals_scored_5", "Home goals scored (last 5)"),
+            ("away_all_avg_goals_scored_5", "Away goals scored (last 5)"),
+            ("home_all_form_points_5", "Home form points (last 5)"),
+            ("away_all_form_points_5", "Away form points (last 5)"),
+            ("h2h_home_win_rate", "H2H home win rate"),
+            ("weather_precipitation_mm", "Rainfall (mm)"),
+        ]
+        drivers = []
+        for key, label in key_features:
+            val = features.get(key)
+            if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                drivers.append({
+                    "feature": label,
+                    "importance": round(abs(float(val)) / 10, 4),
+                    "value": round(float(val), 3),
+                })
+        return drivers[:5]
 
+    def _fallback(self, features: dict) -> dict:
         return {
             "confidence_band": "low",
             "prob_home_win": features.get("poisson_prob_home_win", 0.45),
             "prob_draw": features.get("poisson_prob_draw", 0.25),
             "prob_away_win": features.get("poisson_prob_away_win", 0.30),
-            "prob_btts": features.get("poisson_prob_btts", 0.50),
-            "prob_over_25": features.get("poisson_prob_over25", 0.52),
-            "top_scores": [{"score": "1-1", "prob": 0.12}, {"score": "1-0", "prob": 0.11}],
+            "prob_btts": 0.50,
+            "prob_over_25": 0.52,
+            "top_scores": [{"score": "1-1", "prob": 0.12, "home": 1, "away": 1}],
             "ev_flags": [],
             "shap_drivers": [],
-            "model_name": "fallback_poisson",
-            "warning": "Model unavailable — using Poisson fallback",
+            "model_name": "Fallback Poisson",
+            "warning": "Insufficient data for full prediction",
         }
