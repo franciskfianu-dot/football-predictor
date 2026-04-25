@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # API Keys
     OPENWEATHER_API_KEY: str = ""
+    FOOTBALL_DATA_API_KEY: str = ""
 
     # Admin
     ADMIN_SECRET_TOKEN: str = "change_me"
